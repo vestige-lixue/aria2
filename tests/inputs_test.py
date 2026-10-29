@@ -44,6 +44,16 @@ class InputsTest(unittest.TestCase):
     def test_static_pie_without_shared_libraries_is_accepted(self):
         self.assertEqual(inputs.inspect_binary(elf(segment=2), 'linux', 'x64')['linkage'], 'static-musl')
 
+    def test_installed_apk_packages_are_read_from_the_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'installed'
+            database.write_text('C:Q1abc=\nP:musl\nV:1.2.5-r24\nA:x86_64\n\nP:libgcc\nV:15.2.0-r2\n\n'
+                                'P:libstdc++\nV:15.2.0-r2\n', encoding='utf-8')
+            self.assertEqual(inputs.installed_apk_packages(['musl', 'libgcc', 'libstdc++'], database),
+                             ['musl-1.2.5-r24', 'libgcc-15.2.0-r2', 'libstdc++-15.2.0-r2'])
+            with self.assertRaisesRegex(ValueError, 'not found'):
+                inputs.installed_apk_packages(['openssl'], database)
+
     def test_traversal_and_windows_paths_are_rejected(self):
         for name in ('../outside', '/absolute', 'root/../../outside', 'C:/file', 'root\\file'):
             with self.subTest(name=name), self.assertRaises(ValueError):

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# A bare failed [[ ]] under set -e exits without saying which check failed.
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
 builder="$(cd "$(dirname "$0")/.." && pwd)"
 upstream="$(cd "$builder/../upstream" && pwd)"
 target="$TARGET_PLATFORM-$TARGET_ARCH"
@@ -9,7 +15,7 @@ case "$target" in
   *) echo "Unsupported target: $target" >&2; exit 1 ;;
 esac
 actual_commit="$(git -c safe.directory="$upstream" -C "$upstream" rev-parse HEAD)"
-[[ "$actual_commit" == "$ARIA2_COMMIT" ]]
+[[ "$actual_commit" == "$ARIA2_COMMIT" ]] || fail "Upstream checkout is $actual_commit, expected $ARIA2_COMMIT"
 work="$builder/.work/$target"
 prefix="$work/prefix"
 python3 "$builder/scripts/inputs.py" fetch
@@ -37,19 +43,22 @@ if [[ "$TARGET_PLATFORM" == win32 ]]; then
 elif [[ "$TARGET_PLATFORM" == darwin ]]; then
   export MACOSX_DEPLOYMENT_TARGET="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["macosDeploymentTarget"])' "$builder/dependencies.json")"
   if [[ "$TARGET_ARCH" == x64 ]]; then cpu=x86_64; else cpu=arm64; fi
-  [[ "$(uname -m)" == "$cpu" ]]
+  [[ "$(uname -m)" == "$cpu" ]] || fail "Build host is $(uname -m), expected $cpu"
   export CFLAGS="$CFLAGS -arch $cpu -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
   export CXXFLAGS="$CXXFLAGS -arch $cpu -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
   export LDFLAGS="$LDFLAGS -arch $cpu -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
   tls_args=(--with-appletls --without-wintls --without-openssl --with-libgmp)
 else
   if [[ "$TARGET_ARCH" == x64 ]]; then cpu=x86_64; else cpu=aarch64; fi
-  [[ "$(uname -m)" == "$cpu" ]]
-  [[ -f /etc/alpine-release ]]
+  [[ "$(uname -m)" == "$cpu" ]] || fail "Build host is $(uname -m), expected $cpu"
+  [[ -f /etc/alpine-release ]] || fail "Linux builds must run in the pinned Alpine image"
   expected_gcc="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["linuxRuntimeNotices"]["gcc-license"]["version"])' "$builder/dependencies.json")"
   expected_musl="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["linuxRuntimeNotices"]["musl"]["version"])' "$builder/dependencies.json")"
-  [[ "$(gcc -dumpfullversion)" == "$expected_gcc" ]]
-  apk info -v musl | grep -q "^musl-$expected_musl-r"
+  actual_gcc="$(gcc -dumpfullversion)"
+  [[ "$actual_gcc" == "$expected_gcc" ]] || fail "GCC is $actual_gcc, expected $expected_gcc"
+  # apk-tools 3 changed its console output; the musl loader reports its own version and exits 1.
+  actual_musl="$("/lib/ld-musl-$cpu.so.1" 2>&1 | sed -n 's/^Version //p' || true)"
+  [[ "$actual_musl" == "$expected_musl" ]] || fail "musl is ${actual_musl:-unknown}, expected $expected_musl"
   export LDFLAGS="$LDFLAGS -static"
   tls_args=(--with-openssl --without-appletls --without-wintls --without-libgmp)
 fi
@@ -59,7 +68,8 @@ autoconf_library() {
   shift
   (
     cd "$work/src/$name"
-    ./configure "${host_args[@]}" --prefix="$prefix" --libdir="$prefix/lib" \
+    # macOS /bin/bash 3.2 treats an empty "${array[@]}" as unbound under set -u.
+    ./configure ${host_args[@]+"${host_args[@]}"} --prefix="$prefix" --libdir="$prefix/lib" \
       --enable-static --disable-shared "$@"
     make -j"$jobs"
     make install
@@ -124,10 +134,20 @@ fi
 # A Git checkout, pinned to the resolved upstream commit, keeps generated
 # configure files from hiding a different source revision in a release tarball.
 export CFLAGS="$CFLAGS -std=gnu11"
+# aria2 1.37.0 uses std::back_inserter without <iterator>, which newer libc++ no
+# longer includes transitively. Include it after config.h, so feature and large-file
+# macros still precede every system header; configure probes see an empty header.
+cat > "$work/aria2-compat.h" <<'EOF'
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#  include <iterator>
+#endif
+EOF
+export CXXFLAGS="$CXXFLAGS -include $work/aria2-compat.h"
 (cd "$upstream"; autoreconf -fi)
 (
   cd "$work/aria2-build"
-  "$upstream/configure" "${host_args[@]}" "${tls_args[@]}" \
+  "$upstream/configure" ${host_args[@]+"${host_args[@]}"} "${tls_args[@]}" \
     --prefix="$prefix" --enable-static --disable-shared --disable-nls --disable-werror \
     --enable-bittorrent --enable-metalink --enable-websocket --disable-libaria2 \
     --with-libz --with-libcares --with-libexpat --with-sqlite3 --with-libssh2 \

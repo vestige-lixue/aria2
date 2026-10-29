@@ -208,6 +208,20 @@ def inspect_binary(data, platform, arch):
     return result
 
 
+def installed_apk_packages(names, database=Path('/lib/apk/db/installed')):
+    """Read Alpine package versions from the installed database, independent of apk's console output."""
+    versions, package = {}, None
+    for line in database.read_text(encoding='utf-8').splitlines():
+        if line.startswith('P:'):
+            package = line[2:]
+        elif line.startswith('V:') and package in names:
+            versions[package] = line[2:]
+    missing = [name for name in names if name not in versions]
+    if missing:
+        raise ValueError(f'Installed Alpine packages not found: {missing}')
+    return [f'{name}-{versions[name]}' for name in names]
+
+
 def notices(source, destination, name):
     candidates = [path for path in source.iterdir() if path.is_file()
                   and re.match(r'(?i)^(copying|licen[cs]e|notice|copyright|authors)(\b|[._-])', path.name)]
@@ -275,7 +289,7 @@ def package():
                 'tls': {'win32': 'WinTLS', 'darwin': 'AppleTLS', 'linux': 'OpenSSL'}[platform]}
     if platform == 'linux':
         metadata['runtimeNotices'] = locked['linuxRuntimeNotices']
-        metadata['runtimePackages'] = subprocess.check_output(['apk', 'info', '-v', 'musl', 'libgcc', 'libstdc++'], text=True).splitlines()
+        metadata['runtimePackages'] = installed_apk_packages(['musl', 'libgcc', 'libstdc++'])
     write_json(bundle / 'build.json', metadata)
     release = ROOT / 'release'
     release.mkdir(exist_ok=True)
