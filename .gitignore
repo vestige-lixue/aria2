@@ -1,0 +1,4 @@
+/.work/
+/release/
+__pycache__/
+*.pyc

@@ -1,0 +1,69 @@
+name: Keep scheduled workflows active
+description: Update LAST_CHECK after the default branch has been inactive for `interval-days`.
+
+inputs:
+  interval-days:
+    description: Minimum days since the latest default-branch commit or LAST_CHECK.
+    default: '50'
+
+outputs:
+  updated:
+    description: Whether the action committed a new LAST_CHECK timestamp.
+    value: ${{ steps.keepalive.outputs.updated }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check activity and update LAST_CHECK
+      id: keepalive
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        INTERVAL_DAYS: ${{ inputs.interval-days }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        COMMIT_ACTOR: ${{ github.actor }}
+        COMMIT_ACTOR_ID: ${{ github.actor_id }}
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" != Linux || ! "$INTERVAL_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::Use a Linux runner and a positive integer for interval-days."
+          exit 1
+        fi
+        if [[ "$(git symbolic-ref --quiet --short HEAD)" != "$DEFAULT_BRANCH" ]]; then
+          echo "::error::Check out the repository's default branch before running keepalive."
+          exit 1
+        fi
+        git fetch origin "$DEFAULT_BRANCH"
+        git merge --ff-only FETCH_HEAD
+
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        cutoff="$(date -u --date="$now $INTERVAL_DAYS days ago" +%s)"
+        last_activity="$(git log -1 --format=%ct)"
+        if [[ -L LAST_CHECK || -d LAST_CHECK ]]; then
+          echo "::error::LAST_CHECK must be a regular file."
+          exit 1
+        fi
+        if [[ -f LAST_CHECK ]]; then
+          last_check="$(cat LAST_CHECK)"
+          if [[ -z "${last_check//[[:space:]]/}" ]]; then
+            echo "::error::LAST_CHECK must contain a timestamp."
+            exit 1
+          fi
+          checked="$(date -u --date="$last_check" +%s)"
+          if (( checked > last_activity )); then
+            last_activity="$checked"
+          fi
+        fi
+        if (( last_activity > cutoff )); then
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          echo "Recent repository activity; no keepalive needed."
+          exit 0
+        fi
+
+        printf '%s' "$now" > LAST_CHECK
+        git add -- LAST_CHECK
+        git -c user.name="$COMMIT_ACTOR" \
+          -c user.email="$COMMIT_ACTOR_ID+$COMMIT_ACTOR@users.noreply.github.com" \
+          commit --only -m "Automated: Update LAST_CHECK" -- LAST_CHECK
+        git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+        echo "updated=true" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,215 @@
+name: Build aria2
+
+on:
+  schedule:
+    - cron: '7 4 * * *'
+  workflow_dispatch:
+    inputs:
+      aria2_tag:
+        description: Published stable upstream tag (empty selects the latest stable version)
+        required: false
+        type: string
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ['README.md', 'LAST_CHECK']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aria2-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: |
+          bash -n scripts/build.sh
+          node --check scripts/smoke.mjs
+          node --test tests/*.test.mjs
+          python3 -m unittest discover -s tests -p '*_test.py'
+
+  check:
+    needs: validate
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      commit: ${{ steps.check.outputs.commit }}
+      recipe: ${{ steps.check.outputs.recipe }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Select one stable upstream commit for every target
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARIA2_TAG: ${{ inputs.aria2_tag }}
+        run: node scripts/release.mjs check
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: win32, arch: x64, os: ubuntu-24.04 }
+          - { platform: win32, arch: arm64, os: ubuntu-24.04 }
+          - { platform: darwin, arch: x64, os: macos-15-intel }
+          - { platform: darwin, arch: arm64, os: macos-26 }
+          - { platform: linux, arch: x64, os: ubuntu-24.04 }
+          - { platform: linux, arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      TARGET_PLATFORM: ${{ matrix.platform }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      ARIA2_TAG: ${{ needs.check.outputs.upstream_tag }}
+      ARIA2_COMMIT: ${{ needs.check.outputs.commit }}
+      BUILD_RECIPE: ${{ needs.check.outputs.recipe }}
+      BUILDER_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: builder
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: aria2/aria2
+          ref: ${{ needs.check.outputs.commit }}
+          path: upstream
+          persist-credentials: false
+      - name: Install host build tools
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          if [[ "$TARGET_PLATFORM" == darwin ]]; then
+            brew install autoconf automake libtool gettext pkgconf
+            echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          else
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y \
+              autoconf automake autopoint build-essential gettext libtool pkg-config python3 perl xz-utils
+          fi
+      - name: Build Windows or macOS
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: bash builder/scripts/build.sh
+      - name: Build Linux with native musl compilers
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          image=$(python3 -c 'import json; print(json.load(open("builder/dependencies.json"))["linuxImage"])')
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            -e TARGET_PLATFORM -e TARGET_ARCH -e ARIA2_TAG -e ARIA2_COMMIT \
+            -e BUILD_RECIPE -e BUILDER_COMMIT \
+            "$image" /bin/sh -ec '
+              apk add --no-cache bash build-base autoconf automake gettext-dev libtool pkgconf python3 perl linux-headers git
+              bash builder/scripts/build.sh
+            '
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: aria2-candidate-${{ matrix.platform }}-${{ matrix.arch }}
+          path: builder/release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  verify:
+    needs: [check, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: win32, arch: x64, os: windows-2025 }
+          - { platform: win32, arch: arm64, os: windows-11-arm }
+          - { platform: darwin, arch: x64, os: macos-15-intel }
+          - { platform: darwin, arch: arm64, os: macos-26 }
+          - { platform: linux, arch: x64, os: ubuntu-24.04 }
+          - { platform: linux, arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: aria2-candidate-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release
+      - name: Verify the extracted package on its native architecture
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          ARIA2_COMMIT: ${{ needs.check.outputs.commit }}
+          BUILD_RECIPE: ${{ needs.check.outputs.recipe }}
+          BUILDER_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          python scripts/inputs.py verify
+          node scripts/smoke.mjs ".work/verify/aria2-bin-$TARGET_PLATFORM-$TARGET_ARCH/aria2c$([[ "$TARGET_PLATFORM" == win32 ]] && printf .exe || true)"
+
+  publish:
+    needs: [check, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: aria2-candidate-*
+          path: release
+          merge-multiple: true
+      - name: Publish all verified targets together
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARIA2_TAG: ${{ needs.check.outputs.upstream_tag }}
+          ARIA2_COMMIT: ${{ needs.check.outputs.commit }}
+          BUILD_RECIPE: ${{ needs.check.outputs.recipe }}
+          RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+        run: node scripts/release.mjs publish
+
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: ./.github/actions/keepalive
