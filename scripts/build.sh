@@ -35,9 +35,10 @@ if [[ "$TARGET_PLATFORM" == win32 ]]; then
   export RC="$host-windres" WINDRES="$host-windres"
   export CPPFLAGS="$CPPFLAGS -DCARES_STATICLIB -DXML_STATIC"
   export LDFLAGS="$LDFLAGS -static"
-  # All supported Windows versions provide these functions. Avoid the obsolete
-  # bundled fallback being selected by an unexecutable cross-compile probe.
-  export ac_cv_func_getaddrinfo=yes ac_cv_func_gai_strerror=yes
+  # All supported Windows versions provide getaddrinfo, and a2netcompat.h assumes it
+  # on MinGW. Leave gai_strerror to its link probe: MinGW only exports gai_strerrorA/W,
+  # and a cached "yes" renames calls to my_gai_strerror without building its source.
+  export ac_cv_func_getaddrinfo=yes
   host_args=("--host=$host")
   tls_args=(--with-wintls --without-appletls --without-openssl --with-libgmp)
 elif [[ "$TARGET_PLATFORM" == darwin ]]; then
@@ -135,12 +136,16 @@ fi
 # configure files from hiding a different source revision in a release tarball.
 export CFLAGS="$CFLAGS -std=gnu11"
 # aria2 1.37.0 uses std::back_inserter without <iterator>, which newer libc++ no
-# longer includes transitively. Include it after config.h, so feature and large-file
-# macros still precede every system header; configure probes see an empty header.
+# longer includes transitively. On MinGW, a2netcompat.h always includes
+# gai_strerror.h, which undefines SIZE_MAX; parse libc++'s only SIZE_MAX user,
+# <memory>, before that happens. Include both after config.h, so feature and
+# large-file macros still precede every system header; configure probes see an
+# empty header.
 cat > "$work/aria2-compat.h" <<'EOF'
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
 #  include <iterator>
+#  include <memory>
 #endif
 EOF
 export CXXFLAGS="$CXXFLAGS -include $work/aria2-compat.h"
